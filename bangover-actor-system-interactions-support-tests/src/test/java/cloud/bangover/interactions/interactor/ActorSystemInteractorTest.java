@@ -15,14 +15,11 @@ import cloud.bangover.actors.FixedMessagesWaitingDispatcher;
 import cloud.bangover.actors.Message;
 import cloud.bangover.async.promises.MockErrorHandler;
 import cloud.bangover.async.promises.MockResponseHandler;
-import cloud.bangover.async.promises.WaitingPromise;
 import cloud.bangover.async.timer.Timeout;
 import cloud.bangover.async.timer.TimeoutException;
 import cloud.bangover.async.timer.Timer;
 import cloud.bangover.generators.StubGenerator;
-import cloud.bangover.interactions.interactor.Interactor.Factory;
-import cloud.bangover.interactions.interactor.Interactor.WrongRequestTypeException;
-import cloud.bangover.interactions.interactor.Interactor.WrongResponseTypeException;
+import cloud.bangover.interactions.interactor.RequestReplyInteractor.Factory;
 import lombok.NonNull;
 import org.junit.Assert;
 import org.junit.Test;
@@ -34,10 +31,11 @@ public class ActorSystemInteractorTest {
   private static final Timeout LONG_TIMEOUT = Timeout.ofSeconds(10L);
   private static final Timeout SHORT_TIMEOUT = Timeout.ofMilliseconds(10L);
   private static final ActorName PARSER_ACTOR_NAME = ActorName.wrap("LONG_PARSER");
+  private static final ActorName STRING_PROVIDER_ACTOR_NAME = ActorName.wrap("STRING_PROVIDER");
   private static final CorrelationKey GENERATED_KEY = CorrelationKey.wrap("CORRELATED_KEY");
 
   @Test
-  public void shouldIterationBeCompletedSuccessfully() {
+  public void shouldIterationBeCompletedSuccessfully() throws Exception {
     // Given
     FixedMessagesWaitingDispatcher dispatcher =
         FixedMessagesWaitingDispatcher.singleThreadDispatcher(3);
@@ -49,12 +47,12 @@ public class ActorSystemInteractorTest {
         return new LongParserActor(context);
       }
     });
-    Interactor<String, Long> interactor =
+    RequestReplyInteractor<String, Long> interactor =
         createInteractor(actorSystem, actorAddress, String.class, Long.class, LONG_TIMEOUT);
     MockResponseHandler<Long> resultListener = new MockResponseHandler<Long>();
 
     // When
-    WaitingPromise.of(interactor.invoke("100")).then(resultListener).await();
+    interactor.invoke("100").then(resultListener).await();
     actorSystem.shutdown();
 
     // Then
@@ -62,7 +60,7 @@ public class ActorSystemInteractorTest {
   }
 
   @Test
-  public void shouldCompleteInteractionWithTimeoutError() {
+  public void shouldCompleteInteractionWithTimeoutError() throws Exception {
     // Given
     FixedMessagesWaitingDispatcher dispatcher =
         FixedMessagesWaitingDispatcher.singleThreadDispatcher(2);
@@ -74,18 +72,18 @@ public class ActorSystemInteractorTest {
         return new LongParserActor(context);
       }
     });
-    Interactor<String, Long> interactor =
+    RequestReplyInteractor<String, Long> interactor =
         createInteractor(actorSystem, actorAddress, String.class, Long.class, SHORT_TIMEOUT);
     MockErrorHandler<Throwable> errorListener = new MockErrorHandler<Throwable>();
     // When
-    WaitingPromise.of(interactor.invoke("100")).error(errorListener).await();
+    interactor.invoke("100").error(errorListener).await();
     actorSystem.shutdown();
     // Then
     Assert.assertTrue(errorListener.getHistory().getEntry(0) instanceof TimeoutException);
   }
 
   @Test
-  public void shouldCompleteIterationWithWrongRequestTypeError() {
+  public void shouldCompleteIterationWithWrongRequestTypeError() throws Exception {
     // Given
     FixedMessagesWaitingDispatcher dispatcher =
         FixedMessagesWaitingDispatcher.singleThreadDispatcher(1);
@@ -98,13 +96,13 @@ public class ActorSystemInteractorTest {
       }
     });
     @SuppressWarnings("unchecked")
-    Interactor<Long, Long> interactor =
-        (Interactor<Long, Long>) ((Object) createInteractor(actorSystem, actorAddress, String.class,
+    RequestReplyInteractor<Long, Long> interactor =
+        (RequestReplyInteractor<Long, Long>) ((Object) createInteractor(actorSystem, actorAddress, String.class,
             Long.class, LONG_TIMEOUT));
     MockErrorHandler<Throwable> errorListener = new MockErrorHandler<Throwable>();
 
     // When
-    WaitingPromise.of(interactor.invoke(100L)).error(errorListener).await();
+    interactor.invoke(100L).error(errorListener).await();
     actorSystem.shutdown();
 
     // Then
@@ -112,7 +110,7 @@ public class ActorSystemInteractorTest {
   }
 
   @Test
-  public void shouldCompleteIterationWithWrongResponseTypeError() {
+  public void shouldCompleteIterationWithWrongResponseTypeError() throws Exception {
     // Given
     FixedMessagesWaitingDispatcher dispatcher =
         FixedMessagesWaitingDispatcher.singleThreadDispatcher(1);
@@ -124,16 +122,41 @@ public class ActorSystemInteractorTest {
         return new LongParserActor(context);
       }
     });
-    Interactor<String, String> interactor =
+    RequestReplyInteractor<String, String> interactor =
         createInteractor(actorSystem, actorAddress, String.class, String.class, LONG_TIMEOUT);
     MockErrorHandler<Throwable> errorListener = new MockErrorHandler<Throwable>();
 
     // When
-    WaitingPromise.of(interactor.invoke("100")).error(errorListener).await();
+    interactor.invoke("100").error(errorListener).await();
     actorSystem.shutdown();
 
     // Then
     Assert.assertTrue(errorListener.getHistory().getEntry(0) instanceof WrongResponseTypeException);
+  }
+  
+  @Test
+  public void shouldProvideString() throws Exception {
+    // Given
+    FixedMessagesWaitingDispatcher dispatcher =
+        FixedMessagesWaitingDispatcher.singleThreadDispatcher(5);
+    ActorSystem actorSystem = createActorSystem(dispatcher);
+    actorSystem.start();
+    ActorAddress actorAddress = actorSystem.actorOf(STRING_PROVIDER_ACTOR_NAME, new Actor.Factory<Object>() {
+      @Override
+      public Actor<Object> createActor(Context context) {
+        return new StringProviderActor(context);
+      }
+    });
+    ReplyOnlyInteractor<String> interactor =
+    		createReplyOnlyInteractor(actorSystem, actorAddress, String.class, LONG_TIMEOUT);
+    MockResponseHandler<String> responseHandler = new MockResponseHandler<String>();
+
+    // When
+    interactor.invoke().then(responseHandler).await();
+    actorSystem.shutdown();
+
+    // Then
+    Assert.assertEquals("HELLO", responseHandler.getHistory().getEntry(0));
   }
 
   private ActorSystem createActorSystem(Dispatcher dispatcher) {
@@ -147,11 +170,29 @@ public class ActorSystemInteractorTest {
     });
   }
 
-  private <Q, S> Interactor<Q, S> createInteractor(ActorSystem actorSystem,
+  private <Q, S> RequestReplyInteractor<Q, S> createInteractor(ActorSystem actorSystem,
       ActorAddress targetActor, Class<Q> requestType, Class<S> responseType, Timeout timeout) {
-    Factory interactorFactory = ActorSystemInteractor.factory(actorSystem);
+    Factory interactorFactory = ActorSystemInteractor.requestReplyFactory(actorSystem);
     TargetAddress targetAddress = TargetAddress.ofUrn(targetActor.toString());
     return interactorFactory.createInteractor(targetAddress, requestType, responseType, timeout);
+  }
+  
+  private <S> ReplyOnlyInteractor<S> createReplyOnlyInteractor(ActorSystem actorSystem,
+      ActorAddress targetActor, Class<S> responseType, Timeout timeout) {
+	  ReplyOnlyInteractor.Factory interactorFactory = ActorSystemInteractor.replyOnlyFactory(actorSystem);
+	  TargetAddress targetAddress = TargetAddress.ofUrn(targetActor.toString());
+	  return interactorFactory.createInteractor(targetAddress, responseType, timeout);  
+  }
+  
+  private static class StringProviderActor extends Actor<Object> {
+    public StringProviderActor(@NonNull Context context) {
+	  super(context);
+    }
+    
+	@Override
+    protected void receive(Message<Object> message) throws Throwable {
+      tell(message.replyWith("HELLO"));
+    }  
   }
 
   private static class LongParserActor extends Actor<String> {
@@ -160,7 +201,7 @@ public class ActorSystemInteractorTest {
     }
 
     @Override
-    protected void receive(Message<String> message) {
+    protected void receive(Message<String> message) throws Throwable {
       message.whenIsMatchedTo(String.class, new Message.MessageHandleFunction<String>() {
         @Override
         public void receive(String value) {

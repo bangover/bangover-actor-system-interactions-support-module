@@ -6,7 +6,6 @@ import cloud.bangover.actors.ActorName;
 import cloud.bangover.actors.ActorSystem;
 import cloud.bangover.actors.CorrelationKey;
 import cloud.bangover.actors.Message;
-import cloud.bangover.async.promise.AsyncResolverProxy;
 import cloud.bangover.async.promises.Deferred;
 import cloud.bangover.async.promises.Promise;
 import cloud.bangover.async.promises.Promises;
@@ -14,7 +13,10 @@ import cloud.bangover.async.timer.Timeout;
 import cloud.bangover.async.timer.TimeoutException;
 import cloud.bangover.async.timer.TimeoutSupervisor;
 import cloud.bangover.async.timer.Timer;
+
+import java.util.Optional;
 import java.util.UUID;
+
 import lombok.AccessLevel;
 import lombok.NonNull;
 import lombok.RequiredArgsConstructor;
@@ -31,7 +33,7 @@ import lombok.RequiredArgsConstructor;
  * @param <S> The response type name
  */
 @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
-public final class ActorSystemInteractor<Q, S> implements Interactor<Q, S> {
+public final class ActorSystemInteractor<Q, S> implements RequestReplyInteractor<Q, S> {
   private final ActorSystem actorSystem;
   private final Class<Q> requestType;
   private final Class<S> repsponseType;
@@ -39,21 +41,46 @@ public final class ActorSystemInteractor<Q, S> implements Interactor<Q, S> {
   private final Timeout timeout;
 
   /**
-   * Get the actor system interactor factory.
+   * Get the actor system request-reply interactor factory.
    *
    * @param actorSystem The actor system
    * @return The interactor factory
    */
-  public static final Factory factory(@NonNull ActorSystem actorSystem) {
-    return new ActorInteractorFactory(actorSystem);
+  public static final RequestReplyInteractor.Factory requestReplyFactory(
+      @NonNull ActorSystem actorSystem) {
+    return new ActorRequestReplyInteractorFactory(actorSystem);
+  }
+
+  /**
+   * Get the actor system reply-only interactor factory.
+   *
+   * @param actorSystem The actor system
+   * @return The interactor factory
+   */
+  public static final ReplyOnlyInteractor.Factory replyOnlyFactory(
+      @NonNull ActorSystem actorSystem) {
+    RequestReplyInteractor.Factory requestReplyFactory = requestReplyFactory(actorSystem);
+    return new ReplyOnlyInteractor.Factory() {
+      @Override
+      public <S> ReplyOnlyInteractor<S> createInteractor(TargetAddress target,
+          Class<S> responseType, Timeout timeout) {
+        RequestReplyInteractor<Void, S> requestReplyInteractor =
+            requestReplyFactory.createInteractor(target, Void.class, responseType, timeout);
+        return new ReplyOnlyInteractor<S>() {
+          @Override
+          public Promise<S> invoke() {
+            return requestReplyInteractor.invoke(null);
+          }
+        };
+      }
+    };
   }
 
   @Override
   public final Promise<S> invoke(Q request) {
     return Promises.of(resolver -> {
-      ActorAddress interactorActor =
-          actorSystem.actorOf(generateActorName(), context -> new InteractorActor(context,
-              createTargetAddress(target), timeout, new AsyncResolverProxy<>(resolver)));
+      ActorAddress interactorActor = actorSystem.actorOf(generateActorName(),
+          context -> new InteractorActor(context, createTargetAddress(target), timeout, resolver));
       actorSystem.tell(Message.createFor(interactorActor, request));
     });
   }
@@ -67,13 +94,14 @@ public final class ActorSystemInteractor<Q, S> implements Interactor<Q, S> {
   }
 
   @RequiredArgsConstructor
-  private static class ActorInteractorFactory implements Factory {
+  private static class ActorRequestReplyInteractorFactory
+      implements RequestReplyInteractor.Factory {
     @NonNull
     private final ActorSystem actorSystem;
 
     @Override
-    public <Q, S> Interactor<Q, S> createInteractor(TargetAddress target, Class<Q> requestType,
-        Class<S> responseType, Timeout timeout) {
+    public <Q, S> RequestReplyInteractor<Q, S> createInteractor(TargetAddress target,
+        Class<Q> requestType, Class<S> responseType, Timeout timeout) {
       return new ActorSystemInteractor<Q, S>(actorSystem, requestType, responseType, target,
           timeout);
     }
@@ -89,8 +117,10 @@ public final class ActorSystemInteractor<Q, S> implements Interactor<Q, S> {
     public InteractorActor(@NonNull Context context, ActorAddress targetAddress, Timeout timeout,
         Deferred<S> resolver) {
       super(context);
-      this.timeoutSupervisor = Timer.supervisor(timeout,
-          () -> tell(Message.createFor(self(), self(), new TimeoutException(timeout))));
+      this.timeoutSupervisor = Timer.supervisor(timeout, () -> {
+        TimeoutException error = new TimeoutException(timeout);
+        tell(Message.createFor(self(), self(), error));
+      });
       this.correlationKey = CorrelationKey.UNCORRELATED;
       this.targetAddress = targetAddress;
       this.stage = Stage.REQUEST_WAITING;
@@ -99,11 +129,14 @@ public final class ActorSystemInteractor<Q, S> implements Interactor<Q, S> {
 
     @Override
     protected void receive(Message<Object> message) throws Throwable {
-      rethrowIfErrorReceived(message.getBody());
       message.whenIsMatchedTo(body -> stage.isRequestWaitingStage(),
           body -> processRequest(message), v -> {
-            message.whenIsMatchedTo(body -> stage.isResponseWaitingStage(),
-                body -> processResponse(message));
+            message.whenIsMatchedTo(body -> stage.isResponseWaitingStage(), body -> {
+              if (body instanceof Throwable) {
+                throw (Throwable) body;
+              }
+              processResponse(message);
+            });
           });
     }
 
@@ -119,23 +152,29 @@ public final class ActorSystemInteractor<Q, S> implements Interactor<Q, S> {
       };
     }
 
-    private void rethrowIfErrorReceived(Object body) throws Throwable {
-      if (body instanceof Throwable) {
-        throw (Throwable) body;
-      }
-    }
-
-    private void processRequest(Message<Object> requestMessage) {
+    @SuppressWarnings("unchecked")
+    private void processRequest(Message<Object> requestMessage) throws Throwable {
       requestMessage.whenIsMatchedTo(requestType, requestBody -> {
         handleRequest(requestMessage.map(v -> requestBody));
       }, requestBody -> {
-        throw new WrongRequestTypeException(repsponseType, requestBody);
+        if (requestBody == null && requestType == Void.class) {
+          handleRequest(requestMessage.map(v -> (Q) requestBody));
+        } else {
+          throw new WrongRequestTypeException(repsponseType, requestBody);
+        }
       });
     }
 
-    private void processResponse(Message<Object> responseMessage) {
-      responseMessage.whenIsMatchedTo(repsponseType, responseBody -> {
-        handleResponse(responseMessage.map(v -> responseBody));
+    @SuppressWarnings("unchecked")
+    private void processResponse(final Message<Object> responseMessage) throws Throwable {
+      responseMessage.whenIsMatchedTo(body -> {
+        return Optional.ofNullable(body)
+            .map(v -> repsponseType.isInstance(v))
+            .orElseGet(() -> {
+              return repsponseType == Void.class;
+            });
+      }, body -> {
+        handleResponse(responseMessage.map(v -> (S) body));
         completeInteraction();
       }, responseBody -> {
         throw new WrongResponseTypeException(repsponseType, responseBody);
@@ -149,7 +188,7 @@ public final class ActorSystemInteractor<Q, S> implements Interactor<Q, S> {
       tell(requestMessage.withDestination(targetAddress).withSender(self()));
     }
 
-    private void handleResponse(Message<S> responseMessage) {
+    private void handleResponse(Message<S> responseMessage) throws Throwable {
       responseMessage.whenIsMatchedTo(v -> isResponseCorrelatedToRequest(responseMessage),
           responseBody -> {
             timeoutSupervisor.stopSupervision();

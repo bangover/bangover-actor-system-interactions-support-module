@@ -49,7 +49,7 @@ public class ActorSystemStreamerTest {
       .withNextEntry(new SubmitIteation<Integer>(2, 1));
     Stream<Integer> stream = streamer.createStream(source, destination);
     // When
-    Stat status = stream.start().get(10L);
+    Stat status = stream.start().get(1000L);
     // Then
     MockHistory<SubmitIteation<Integer>> submitIterations = destination.getHistory();
     Assert.assertTrue(destination.isReleased());

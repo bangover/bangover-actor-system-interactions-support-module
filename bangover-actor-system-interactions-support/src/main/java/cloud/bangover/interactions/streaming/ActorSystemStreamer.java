@@ -5,7 +5,6 @@ import cloud.bangover.actors.ActorAddress;
 import cloud.bangover.actors.ActorName;
 import cloud.bangover.actors.ActorSystem;
 import cloud.bangover.actors.Message;
-import cloud.bangover.async.promise.AsyncResolverProxy;
 import cloud.bangover.async.promises.Deferred;
 import cloud.bangover.async.promises.Promise;
 import cloud.bangover.async.promises.Promises;
@@ -137,8 +136,7 @@ public class ActorSystemStreamer implements Streamer {
       public StreamingActor(@NonNull Context context, @NonNull Source<T> source,
           @NonNull Destination<T> destination, @NonNull Deferred<Stat> resolver) {
         super(context);
-        this.transmitter =
-            new StreamingTranmitter(source, destination, new AsyncResolverProxy<>(resolver));
+        this.transmitter = new StreamingTranmitter(source, destination, resolver);
       }
 
       @Override
@@ -186,14 +184,18 @@ public class ActorSystemStreamer implements Streamer {
 
         @Override
         public void complete(Message<Object> message, Long count) {
+          destination.release();
+          source.release();
           resolver.resolve(new CurrentStatus(totalSize));
-          completeStreaming();
+          stop(self());
         }
 
         @Override
         public void fail(Message<Object> message, Throwable error) {
+          destination.release();
+          source.release();
           resolver.reject(error);
-          completeStreaming();
+          stop(self());
         }
 
         private void updateTotalSize(int transmittedSize) {
@@ -204,12 +206,6 @@ public class ActorSystemStreamer implements Streamer {
         private void notifyStatusObservers() {
           statusObservers
               .forEach(observer -> observer.onStatusChange(new CurrentStatus(totalSize)));
-        }
-
-        private void completeStreaming() {
-          destination.release();
-          source.release();
-          stop(self());
         }
 
         private DestinationConnection<T> createDestinationConnection(Message<Object> message) {

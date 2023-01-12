@@ -34,13 +34,11 @@
 		<dependency>
 			<groupId>cloud.bangover.interactions</groupId>
 			<artifactId>bangover-interactions</artifactId>
-			<version>0.0.1</version>
 		</dependency>
 
 		<dependency>
 			<groupId>cloud.bangover.actors</groupId>
 			<artifactId>bangover-actors</artifactId>
-			<version>0.0.1</version>
 		</dependency>
 	</dependencies>
 
